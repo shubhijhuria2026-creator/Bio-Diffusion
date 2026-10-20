@@ -1,0 +1,294 @@
+"""
+Biological Diffusion - O2 in deep pulmonary airways
+====================================================
+Fixes the "constant-D Fick" loophole in two steps:
+
+  Model A : Fick, constant D                       (what the textbook does)
+  Model B : Fick, D = D(T, P, composition)         (Blanc mixing law, D ~ T^1.75 / P)
+  Model C : Stefan-Maxwell + pressure              (O2, CO2, H2O, N2 interact; drag,
+                                                    pressure term, N2 gradient at zero flux)
+
+  + transient reaction-diffusion  dC/dt = d/dx(D dC/dx) - R(C)   with D(T,P,x)  (slide 4 equation)
+
+Pressure enters in THREE places:
+  1. c_total = P/(R T)                          (ideal gas -> concentration depends on P)
+  2. D_ij(T,P) = D_ij0 (T/T0)^1.75 (P0/P)       (Chapman-Enskog scaling)
+  3. barodiffusion term (x_i - w_i) dP/dx / P   (w_i = mass fraction) in the Stefan-Maxwell eqn
+
+Geometry: x = 0 is the entrance of the acinus (bulk air), x = L is the alveolar membrane.
+Positive flux = towards the membrane. N2 is insoluble -> N2 net flux = 0 (stagnant gas).
+
+Run:  python lung_diffusion_ms.py        (needs numpy, scipy, matplotlib)
+"""
+import numpy as np
+from scipy.integrate import solve_ivp
+from scipy.optimize import brentq
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ----------------------------------------------------------------------------
+# 1. Constants and gas data   (species order: 0=O2, 1=CO2, 2=H2O, 3=N2)
+# ----------------------------------------------------------------------------
+R = 8.314                                   # J/(mol K)
+SPECIES = ["O2", "CO2", "H2O", "N2"]
+M = np.array([32.0, 44.0, 18.0, 28.0]) * 1e-3   # kg/mol
+T0, P0 = 298.15, 101325.0                   # reference state for D_ij0
+MMHG = 133.322
+
+# Binary diffusivities at (T0, P0) in m^2/s  (APPROXIMATE placeholders - replace with cited data)
+D0 = np.zeros((4, 4))
+for (i, j), v in {(0, 1): 1.60e-5, (0, 2): 2.80e-5, (0, 3): 2.10e-5,
+                  (1, 2): 2.00e-5, (1, 3): 1.65e-5, (2, 3): 2.60e-5}.items():
+    D0[i, j] = D0[j, i] = v
+
+
+def p_sat_water(T):
+    """Saturation vapour pressure of water [Pa] (Magnus formula)."""
+    Tc = T - 273.15
+    return 610.94 * np.exp(17.625 * Tc / (Tc + 243.04))
+
+
+def Dij(T, P):
+    """Binary diffusivity matrix at local T [K], P [Pa]."""
+    return D0 * (T / T0) ** 1.75 * (P0 / P)
+
+
+def D_mix(i, x, T, P):
+    """Blanc's law: effective diffusivity of species i in the local mixture."""
+    D = Dij(T, P)
+    mask = np.arange(4) != i
+    xr = x[mask] / max(x[mask].sum(), 1e-12)
+    return 1.0 / np.sum(xr / D[i, mask])
+
+
+# ----------------------------------------------------------------------------
+# 2. Scenario definition
+# ----------------------------------------------------------------------------
+class Scenario:
+    def __init__(self, name, L=5e-3, J_O2=2e-3, RQ=0.8, T_in=300.0, T_body=310.15,
+                 P_in=P0, dP=5.0, RH_in=0.5, x_CO2_in=4e-4):
+        self.name, self.L, self.J_O2, self.RQ = name, L, J_O2, RQ
+        self.T_in, self.T_body = T_in, T_body
+        self.P_in, self.dP = P_in, dP          # dP = viscous pressure drop over L [Pa]
+        self.RH_in, self.x_CO2_in = RH_in, x_CO2_in
+
+    def T(self, x):  return self.T_in + (self.T_body - self.T_in) * x / self.L
+    def P(self, x):  return self.P_in - self.dP * x / self.L       # drops toward alveoli
+    def dPdx(self):  return -self.dP / self.L
+
+    def inlet(self):
+        """Inlet mole fractions: humidified air, N2/O2 in the dry-air ratio."""
+        xw = self.RH_in * p_sat_water(self.T_in) / self.P_in
+        dry = 1.0 - xw - self.x_CO2_in
+        return np.array([0.2095 / 0.9999 * dry, self.x_CO2_in, xw, 0.7904 / 0.9999 * dry])
+
+
+# ----------------------------------------------------------------------------
+# 3. Model A and B : Fick
+# ----------------------------------------------------------------------------
+def fick_const_D(s, n=200):
+    """Model A: constant D (O2-N2 at 298 K, 1 atm), constant c at body conditions."""
+    x = np.linspace(0, s.L, n)
+    xin = s.inlet()[0]
+    c = s.P_in / (R * s.T_body)
+    xO2 = xin - s.J_O2 * x / (c * D0[0, 3])
+    return x, xO2 * s.P_in / MMHG          # pO2 [mmHg]
+
+
+def fick_variable_D(s, n=400):
+    """Model B: Fick with D(T,P,x). J = -c D dx/dx ,  x_O2 integrated along the airway."""
+    xs = np.linspace(0, s.L, n)
+    xin = s.inlet()
+    xO2 = np.zeros(n); xO2[0] = xin[0]
+    for k in range(n - 1):
+        xm = xs[k]
+        T, P = s.T(xm), s.P(xm)
+        # background gases keep their inlet ratio (Fick has no way to treat them otherwise)
+        x = np.array([xO2[k], 0, 0, 0])
+        rest = 1 - xO2[k]
+        bg = xin[1:] / xin[1:].sum() * rest
+        x[1:] = bg
+        D = D_mix(0, x, T, P)
+        c = P / (R * T)
+        xO2[k + 1] = xO2[k] - s.J_O2 * (xs[1] - xs[0]) / (c * D)
+    P = np.array([s.P(v) for v in xs])
+    return xs, xO2 * P / MMHG
+
+
+# ----------------------------------------------------------------------------
+# 4. Model C : Stefan-Maxwell + pressure  (steady state, N2 stagnant)
+# ----------------------------------------------------------------------------
+def ms_rhs(xpos, x, N, s):
+    """dx_i/dxpos from the Stefan-Maxwell equations with the barodiffusion term."""
+    T, P = s.T(xpos), s.P(xpos)
+    D = Dij(T, P)
+    F = np.zeros(4)                                   # friction forces / (inter-species)
+    for i in range(4):
+        for j in range(4):
+            if i != j:
+                F[i] += (x[i] * N[j] - x[j] * N[i]) / D[i, j]
+    F *= R * T                                        # = P*dx_i + x_i dP  (before wall term)
+    w = x * M / np.dot(x, M)                          # mass fractions
+    return (F + (w - x) * s.dPdx()) / P
+
+
+def ms_profile(s, N_H2O, n=400):
+    N = np.array([s.J_O2, -s.RQ * s.J_O2, N_H2O, 0.0])
+    sol = solve_ivp(lambda xp, y: ms_rhs(xp, y, N, s), [0, s.L], s.inlet(),
+                    t_eval=np.linspace(0, s.L, n), rtol=1e-10, atol=1e-12)
+    return sol.t, sol.y, N
+
+
+def solve_ms(s, N_H2O=None):
+    """Steady Stefan-Maxwell profile. If N_H2O is None it is solved so that the gas at the
+    membrane is saturated with water vapour at body temperature (physical boundary condition)."""
+    if N_H2O is None:
+        def resid(NW):
+            xs, y, _ = ms_profile(s, NW, n=2)
+            return y[2, -1] - p_sat_water(s.T_body) / s.P(s.L)
+        scale = s.J_O2
+        N_H2O = brentq(resid, -50 * scale, 50 * scale, xtol=1e-14)
+    xs, y, N = ms_profile(s, N_H2O)
+    return xs, y, N
+
+
+def uphill_report(s, xs, y, N):
+    """Where does a species move against its own partial-pressure gradient?"""
+    P = np.array([s.P(v) for v in xs])
+    dPdx = np.gradient(P, xs)
+    out = {}
+    for i, sp in enumerate(SPECIES):
+        p = y[i] * P
+        dp = np.gradient(p, xs)
+        # diffusive flux direction should be -dp/dx ; uphill if N and dp/dx have same sign
+        bad = (N[i] * dp > 0) & (np.abs(dp) > 1e-9)
+        out[sp] = 100.0 * bad.mean() if abs(N[i]) > 0 else float("nan")
+    return out
+
+
+# ----------------------------------------------------------------------------
+# 5. Transient reaction-diffusion with D(T,P,x):  dC/dt = d/dx(D dC/dx) - R(C)
+# ----------------------------------------------------------------------------
+def transient_O2(s, t_end=0.5, n=80):
+    """O2 partial pressure p(x,t).  Flux = -(D_eff/RT) dp/dx  (gradient of PARTIAL PRESSURE,
+    so pressure and temperature enter the driving force, not only concentration).
+    R(C) = Vmax C / (Km + C) represents uptake along the airway; closed end at x = L."""
+    xs = np.linspace(0, s.L, n); dx = xs[1] - xs[0]
+    xin = s.inlet()
+    T = s.T(xs); P = s.P(xs)
+    Vmax = 1.5 * s.J_O2 / s.L                           # mol/(m^3 s)
+    Km = 2.0                                            # mol/m^3
+    bg = xin[1:] / xin[1:].sum()
+
+    def Deff(p):
+        out = np.empty(n)
+        for k in range(n):
+            xo = p[k] / P[k]
+            x = np.array([xo, *(bg * (1 - xo))])
+            out[k] = D_mix(0, x, T[k], P[k])
+        return out
+
+    def rhs(t, p):
+        p = p.copy()
+        D = Deff(p)
+        Df = 0.5 * (D[1:] + D[:-1]) / (R * 0.5 * (T[1:] + T[:-1]))
+        flux = -Df * np.diff(p) / dx                    # at faces
+        dpdt = np.zeros(n)
+        dpdt[1:-1] = -(flux[1:] - flux[:-1]) / dx * R * T[1:-1]
+        dpdt[-1] = -(0 - flux[-1]) / (dx / 2) * R * T[-1]   # closed end
+        C = p / (R * T)
+        dpdt -= (Vmax * C / (Km + C)) * R * T            # reaction sink, converted to Pa/s
+        dpdt[0] = 0.0                                    # Dirichlet inlet
+        return dpdt
+
+    p0 = xin[0] * P
+    sol = solve_ivp(rhs, [0, t_end], p0, method="BDF", t_eval=[0, t_end / 10, t_end / 3, t_end],
+                    rtol=1e-6, atol=1e-3)
+    return xs, sol.t, sol.y / MMHG
+
+
+# ----------------------------------------------------------------------------
+# 6. Run scenarios, print comparison, save figure
+# ----------------------------------------------------------------------------
+def main():
+    scenarios = [
+        Scenario("Rest", J_O2=2e-3, dP=5.0),
+        Scenario("Exercise (5x flux, 5x dP, hot air)", J_O2=1e-2, dP=25.0, T_in=290.0, RH_in=0.3),
+        Scenario("Obstructed airway (large dP)", J_O2=2e-3, dP=800.0),
+        Scenario("Hyperbaric 3 atm (diver)", J_O2=2e-3, dP=15.0, P_in=3 * P0),
+    ]
+
+    fig, ax = plt.subplots(2, 3, figsize=(15, 8.5))
+    print(f"\n{'Scenario':36s} {'pO2 end A':>10s} {'pO2 end B':>10s} {'pO2 end C':>10s} "
+          f"{'N2 grad C':>11s} {'N_H2O':>10s}")
+    print("-" * 92)
+    for k, s in enumerate(scenarios):
+        xA, pA = fick_const_D(s)
+        xB, pB = fick_variable_D(s)
+        xC, y, N = solve_ms(s)
+        P = np.array([s.P(v) for v in xC])
+        pC = y[0] * P / MMHG
+        dN2 = (y[3, -1] - y[3, 0]) * 100
+        print(f"{s.name:36s} {pA[-1]:10.2f} {pB[-1]:10.2f} {pC[-1]:10.2f} "
+              f"{dN2:10.3f}% {N[2]:10.2e}")
+        print("   uphill-flux fraction of airway (%):",
+              {k2: round(float(v), 1) for k2, v in uphill_report(s, xC, y, N).items()})
+        if k == 0:
+            ax[0, 0].plot(xA * 1e3, pA, "--", label="A: Fick, const D")
+            ax[0, 0].plot(xB * 1e3, pB, "-.", label="B: Fick, D(T,P,x)")
+            ax[0, 0].plot(xC * 1e3, pC, "-", lw=2, label="C: Stefan-Maxwell + P")
+            ax[0, 0].set(title=f"pO2 along airway ({s.name})", xlabel="x [mm]", ylabel="pO2 [mmHg]")
+            ax[0, 0].legend()
+            for i, sp in enumerate(SPECIES):
+                ax[0, 1].plot(xC * 1e3, y[i] * 100, label=sp)
+            ax[0, 1].set(title="Mole fractions, Model C", xlabel="x [mm]", ylabel="%")
+            ax[0, 1].set_yscale("log"); ax[0, 1].legend()
+            ax[0, 2].plot(xC * 1e3, (y[3] - y[3, 0]) * 100, label="Model C (N2 flux = 0)")
+            ax[0, 2].axhline(0, color="k", ls="--", label="Fick prediction (flat)")
+            ax[0, 2].set(title="N2 'reverse' gradient at zero flux", xlabel="x [mm]",
+                         ylabel="change in x_N2 [%]"); ax[0, 2].legend()
+
+    # Drag demo: weak O2 flux, strong forced H2O flux towards the membrane (e.g. condensation)
+    sd = Scenario("Drag demo", J_O2=2e-4, dP=5.0)
+    xd, yd, Nd = solve_ms(sd, N_H2O=2e-2)
+    Pd = np.array([sd.P(v) for v in xd])
+    print("\nDRAG DEMO (O2 flux toward membrane, H2O dragged toward membrane):")
+    print("   O2 uphill fraction (%):", round(float(uphill_report(sd, xd, yd, Nd)['O2']), 1),
+          "| pO2 inlet -> end [mmHg]:", round(yd[0, 0] * Pd[0] / MMHG, 2), "->",
+          round(yd[0, -1] * Pd[-1] / MMHG, 2), "(rises while O2 still flows in: uphill)")
+
+    # D vs temperature / pressure  (the original loophole)
+    Tg = np.linspace(290, 315, 50)
+    for Pm in (1, 2, 3):
+        ax[1, 0].plot(Tg - 273.15, [Dij(T, Pm * P0)[0, 3] * 1e5 for T in Tg], label=f"P = {Pm} atm")
+    ax[1, 0].set(title="D(O2-N2) is NOT constant", xlabel="T [C]", ylabel="D [1e-5 m2/s]")
+    ax[1, 0].legend()
+
+    # scenario comparison bars
+    names, dA, dC = [], [], []
+    for s in scenarios:
+        xA, pA = fick_const_D(s); xC, y, N = solve_ms(s)
+        pC = y[0] * np.array([s.P(v) for v in xC]) / MMHG
+        names.append(s.name.split("(")[0].strip()); dA.append(pA[0] - pA[-1]); dC.append(pC[0] - pC[-1])
+    w = 0.38; idx = np.arange(len(names))
+    ax[1, 1].bar(idx - w / 2, dA, w, label="A: Fick const D")
+    ax[1, 1].bar(idx + w / 2, dC, w, label="C: Stefan-Maxwell + P")
+    ax[1, 1].set_xticks(idx); ax[1, 1].set_xticklabels(names, fontsize=8, rotation=10)
+    ax[1, 1].set(title="pO2 drop needed to carry the O2 flux", ylabel="mmHg"); ax[1, 1].legend()
+
+    # transient
+    s = scenarios[0]
+    xs, ts, Pp = transient_O2(s)
+    for k, t in enumerate(ts):
+        ax[1, 2].plot(xs * 1e3, Pp[:, k], label=f"t = {t:.3f} s")
+    ax[1, 2].set(title="Transient dC/dt = d(D dC/dx) - R(C)", xlabel="x [mm]", ylabel="pO2 [mmHg]")
+    ax[1, 2].legend()
+    print(f"\nTransient steady pO2 at closed end: {Pp[-1, -1]:.2f} mmHg  (inlet {Pp[0, 0]:.2f})")
+
+    plt.tight_layout(); plt.savefig("diffusion_results.png", dpi=140)
+    print("Saved diffusion_results.png")
+
+
+if __name__ == "__main__":
+    main()
